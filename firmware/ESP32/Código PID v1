@@ -1,0 +1,259 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ---------- TEMPERATURA ----------
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensor(&oneWire);
+
+float T = 25.0;
+float vSom = 343.0;
+unsigned long lastTemp = 0;
+
+// ---------- PINOS ----------
+#define TRIG_F 18
+#define ECHO_F 19
+
+#define TRIG_L 21
+#define ECHO_L 22
+
+#define TRIG_R 25
+#define ECHO_R 26
+
+#define BUZZER 27
+#define MOTOR 32
+
+// ---------- CONSTANTES ----------
+#define TIMEOUT 24000
+#define DIST_MAX 400.0
+#define SETPOINT 100.0
+#define DEADZONE 5.0
+
+// ---------- PID ----------
+float Kp = 2.0;
+float Ki = 0.4;
+float Kd = 1.2;
+
+float erro = 0;
+float integral = 0;
+unsigned long tAnterior = 0;
+
+// ---------- KALMAN ----------
+class Kalman2D {
+public:
+  float x[2] = {100, 0};
+  float P[2][2] = {{1,0},{0,1}};
+
+  float Q_base = 0.1;
+  float R_base = 20;
+
+  float R = 20;
+  float Q = 0.1;
+
+  float erroMedio = 0;
+
+  void predict(float dt) {
+    x[0] += x[1]*dt;
+
+    Q = Q_base + abs(x[1]) * 0.01;
+
+    P[0][0] += dt*(2*P[0][1] + dt*P[1][1]) + Q;
+    P[0][1] += dt*P[1][1];
+    P[1][0] += dt*P[1][1];
+    P[1][1] += Q;
+  }
+
+  void update(float z, bool valido) {
+
+    float erro = z - x[0];
+
+    if (!valido) {
+      R = 10000;  // ignora leitura ruim
+    } else {
+      erroMedio = 0.9 * erroMedio + 0.1 * (erro * erro);
+      R = R_base + erroMedio * 0.5;
+    }
+
+    float S = P[0][0] + R;
+
+    float K0 = P[0][0] / S;
+    float K1 = P[1][0] / S;
+
+    x[0] += K0 * erro;
+    x[1] += K1 * erro;
+
+    P[0][0] *= (1 - K0);
+    P[0][1] *= (1 - K0);
+    P[1][0] -= K1 * P[0][0];
+    P[1][1] -= K1 * P[0][1];
+  }
+
+  float getPos() { return x[0]; }
+  float getVel() { return x[1]; }
+};
+
+// ---------- SENSOR ----------
+class Sensor {
+public:
+  int trig, echo;
+  Kalman2D kf;
+  unsigned long lastTime = 0;
+
+  Sensor(int t, int e) {
+    trig = t;
+    echo = e;
+  }
+
+  void begin() {
+    pinMode(trig, OUTPUT);
+    pinMode(echo, INPUT);
+  }
+
+  float medirRaw(bool &valido) {
+
+    digitalWrite(trig, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(trig, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trig, LOW);
+
+    long dur = pulseIn(echo, HIGH, TIMEOUT);
+
+    if (dur <= 0) {
+      valido = false;
+      return 500;
+    }
+
+    float d = (dur / 1000000.0) * vSom * 100.0 / 2.0;
+
+    if (d < 2 || d > DIST_MAX) {
+      valido = false;
+      return 500;
+    }
+
+    valido = true;
+    return d;
+  }
+
+  void atualizar() {
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+    if (dt <= 0) dt = 0.05;
+
+    bool valido;
+    float z = medirRaw(valido);
+
+    kf.predict(dt);
+    kf.update(z, valido);
+
+    lastTime = now;
+  }
+
+  float dist() { return kf.getPos(); }
+  float vel() { return kf.getVel(); }
+};
+
+// ---------- SENSORES ----------
+Sensor sF(TRIG_F, ECHO_F);
+Sensor sL(TRIG_L, ECHO_L);
+Sensor sR(TRIG_R, ECHO_R);
+
+// ---------- SETUP ----------
+void setup() {
+
+  Serial.begin(115200);
+  tempSensor.begin();
+
+  sF.begin();
+  sL.begin();
+  sR.begin();
+
+  ledcAttach(BUZZER, 2000, 8);
+  ledcAttach(MOTOR, 5000, 8);
+
+  Serial.println("Sistema com Debug Completo");
+}
+
+// ---------- LOOP ----------
+void loop() {
+
+  // ---- TEMPERATURA ----
+  if (millis() - lastTemp > 3000) {
+    tempSensor.requestTemperatures();
+    float t = tempSensor.getTempCByIndex(0);
+
+    if (t != DEVICE_DISCONNECTED_C) T = t;
+    vSom = 331.3 + 0.606 * T;
+
+    lastTemp = millis();
+  }
+
+  // ---- LEITURA ----
+  sF.atualizar(); delay(45);
+  sL.atualizar(); delay(45);
+  sR.atualizar(); delay(45);
+
+  float dF = sF.dist();
+  float dL = sL.dist();
+  float dR = sR.dist();
+
+  float vF = sF.vel();
+  float vL = sL.vel();
+  float vR = sR.vel();
+
+  float d = min(dF, min(dL, dR));
+  float v = (d == dF) ? vF : (d == dL ? vL : vR);
+
+  // ---- PID ----
+  unsigned long tAtual = millis();
+  float dt = (tAtual - tAnterior) / 1000.0;
+  if (dt <= 0) dt = 0.05;
+
+  erro = SETPOINT - d;
+
+  if (abs(erro) < DEADZONE) erro = 0;
+
+  if (d >= 500) integral = 0;
+  else integral += erro * dt;
+
+  integral = constrain(integral, -150, 150);
+
+  float derivada = -v;
+
+  float saida = Kp*erro + Ki*integral + Kd*derivada;
+
+  tAnterior = tAtual;
+
+  float ganho = exp(-0.03 * d);
+  if (ganho < 0.05) ganho = 0;
+
+  float controle = saida * ganho;
+
+  int pwm = constrain(controle, 0, 255);
+  ledcWrite(MOTOR, pwm);
+
+  // ---- BUZZER ----
+  if (ganho > 0) {
+    int freq = map(d, 120, 2, 800, 2500);
+    freq = constrain(freq, 800, 2500);
+    ledcWriteTone(BUZZER, freq);
+  } else {
+    ledcWriteTone(BUZZER, 0);
+  }
+
+  // ---- DEBUG COMPLETO ----
+  Serial.println("----- STATUS -----");
+  Serial.print("Temp (C): "); Serial.println(T);
+  Serial.print("Vel Som (m/s): "); Serial.println(vSom);
+
+  Serial.print("F: "); Serial.print(dF);
+  Serial.print(" | L: "); Serial.print(dL);
+  Serial.print(" | R: "); Serial.println(dR);
+
+  Serial.print("Vel (cm/s): "); Serial.println(v);
+  Serial.print("PWM Motor: "); Serial.println(pwm);
+
+  Serial.println("------------------\n");
+
+}
